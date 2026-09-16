@@ -146,9 +146,12 @@ class JobRecommender:
     def recommend(
         self,
         profile: Dict[str, Any],
-        jobs: List[Dict[str, Any]],
+        jobs = None,
         top_k: int = 5
     ) -> Dict[str, Any]:
+        if jobs is None:
+            jobs = profile.get("available_jobs", [])
+            top_k = profile.get("top_n", top_k)
         total_input = len(jobs)
         if total_input == 0:
             return {
