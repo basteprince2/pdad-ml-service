@@ -1,3 +1,7 @@
+"""
+TF-IDF job recommendation engine for Stage 2 employment matching.
+"""
+
 import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -6,276 +10,391 @@ import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-logger = logging.getLogger("ml_service.recommender")
+logger = logging.getLogger("pdad_ml_service")
 
-PRIMARY_BOOST = 0.05
-SECONDARY_BOOST = 0.025
-MIN_SCORE = 0.05
-ACCOMMODATION_BOOST = 0.03
+EDUCATION_RANK: Dict[str, int] = {
+    "none": 0,
+    "sped": 1,
+    "elementary level": 2,
+    "elementary graduate": 3,
+    "als": 3,
+    "junior high school": 4,
+    "high school level": 4,
+    "high school graduate": 5,
+    "senior high school": 5,
+    "senior high school graduate": 6,
+    "vocational": 6,
+    "vocational graduate": 7,
+    "college level": 7,
+    "college graduate": 8,
+    "post graduate": 9,
+}
 
 EXCLUSION_RULES: Dict[str, List[str]] = {
     "Physical Disability": [
-        "heavy lifting", "lifting 25kg", "lifting 50lbs", "construction labor",
-        "manual labor", "climbing stairs", "climb ladders", "standing 8 hours",
-        "continuous standing", "physical patrol", "warehouse carrying", "motorcycle delivery",
-        "roving inspection", "heavy material handling", "warehouse loader"
+        "heavy lifting", "carrying heavy loads", "climbing ladders",
+        "strenuous physical labor", "prolonged standing",
+        "manual construction labor", "warehouse lifting", "scaffolding"
     ],
     "Visual Disability": [
-        "driving", "drive vehicle", "motorcycle", "delivery rider",
-        "precision visual inspection", "microscopic assembly", "graphic inspection without magnifier",
-        "heavy machinery operation", "crane operator", "forklift operator"
+        "driving", "delivery driver", "forklift operator",
+        "operating heavy machinery", "vehicle operation",
+        "fine graphic color grading", "visual inspection of micro-components",
+        "crane operator", "night driving"
     ],
     "Deaf or Hard of Hearing": [
-        "telephone operator", "call center voice", "voice inbound", "verbal telephone",
-        "telephone customer service", "audio transcribing without text", "radio dispatch",
-        "oral phone calls", "inbound phone agent", "voice customer calls"
+        "phone operator", "telephone support", "inbound call reception",
+        "transcribing audio without captions", "telemarketing voice calls",
+        "voice customer service agent"
     ],
     "Speech and Language Disability": [
-        "telemarketing", "verbal sales pitches", "radio announcer", "public speaking broadcast",
-        "oral customer telephone support", "voice call center agent"
-    ]
+        "phone operator", "telephone support", "inbound call reception",
+        "telemarketing voice calls", "radio announcer", "voice customer service agent"
+    ],
+    "Intellectual Disability": [
+        "driving", "forklift operator", "operating heavy machinery",
+        "complex financial portfolio auditing", "high-voltage electrical wiring",
+        "hazardous chemical handling", "heavy machinery operator"
+    ],
+    "Mental Disability": [
+        "extreme high-risk armed security", "hazardous chemical handling",
+        "emergency crisis response unit", "explosives handling"
+    ],
+    "Psychosocial Disability": [
+        "extreme high-risk armed security", "hazardous chemical handling",
+        "emergency crisis response unit", "explosives handling"
+    ],
+    "Cancer (RA 11215)": [
+        "heavy lifting", "strenuous physical labor", "toxic chemical exposure",
+        "radiation exposure", "manual construction labor"
+    ],
+    "Rare Disease (RA 10747)": [
+        "heavy lifting", "strenuous physical labor", "toxic chemical exposure",
+        "hazardous environment"
+    ],
+    "Learning Disability": [
+        "complex legal drafting", "actuarial formula derivation",
+        "high-speed complex financial auditing"
+    ],
 }
 
 MOBILITY_EXCLUSIONS: Dict[str, List[str]] = {
     "Non-Ambulatory": [
-        "delivery", "messenger", "field inspection", "climb stairs", "stairs",
-        "patrol", "manual labor", "heavy lifting", "standing 8 hours", "roving",
-        "climbing ladders", "warehouse loader", "motorcycle"
-    ]
+        "driving", "climbing", "climbing ladders", "heavy lifting",
+        "standing for long periods", "prolonged standing", "field technician",
+        "delivery driver", "warehouse labor", "manual labor", "foot patrol",
+        "stairs climbing", "construction worker"
+    ],
+    "Assisted": [
+        "climbing ladders", "heavy lifting", "running", "rough terrain",
+        "scaffolding", "manual construction labor"
+    ],
 }
 
 DEVICE_EXCLUSIONS: Dict[str, List[str]] = {
     "Wheelchair": [
-        "climb stairs", "stairs", "climbing ladders", "motorcycle delivery",
-        "delivery rider", "heavy lifting", "manual labor", "roving patrol",
-        "field inspection", "standing 8 hours", "warehouse carrying"
+        "climbing", "climbing ladders", "heavy lifting", "prolonged standing",
+        "delivery driver", "field technician", "warehouse labor", "foot patrol",
+        "standing required", "scaffolding", "stairs climbing", "driving"
     ],
     "Crutches": [
-        "carrying heavy loads", "climbing ladders", "motorcycle delivery",
-        "heavy physical labor", "running", "lifting 25kg", "stairs"
+        "climbing ladders", "heavy lifting", "prolonged standing", "scaffolding",
+        "carrying heavy objects"
     ],
     "Walker": [
-        "climbing stairs", "stairs", "motorcycle delivery", "heavy lifting",
-        "field roving", "manual labor"
+        "climbing ladders", "heavy lifting", "prolonged standing", "rough terrain",
+        "delivery driver"
     ],
     "Prosthesis": [
-        "heavy machinery grip", "heavy manual handling 25kg"
-    ]
+        "extreme impact physical labor", "climbing high scaffolding"
+    ],
 }
 
 DEVICE_RELAXATIONS: Dict[Tuple[str, str], List[str]] = {
-    ("Visual Disability", "Eyeglasses"): [
-        "precision visual inspection", "computer screen", "reading fine print"
-    ],
-    ("Physical Disability", "Wheelchair"): [
-        "office", "desk", "computer encoding", "clerical", "administrative"
-    ],
     ("Deaf or Hard of Hearing", "Hearing Aid"): [
-        "face-to-face communication", "in-person coordination"
-    ]
+        "in-person oral communication", "face-to-face customer service", "listening to instructions"
+    ],
+    ("Visual Disability", "Eyeglasses"): [
+        "reading printed documents", "screen viewing", "computer monitor work", "data verification"
+    ],
 }
 
-ACCOMMODATION_KEYWORDS = [
-    "wheelchair accessible", "accessible workplace", "pwd friendly",
-    "ramp available", "elevator access", "ground floor", "work from home",
-    "remote work", "assistive technology provided", "inclusive employer"
-]
+DISABILITY_KEYWORDS: Dict[str, List[str]] = {
+    "Deaf or Hard of Hearing": [
+        "sign language interpreter", "chat-based", "written communication",
+    ],
+    "Physical Disability": [
+        "wheelchair accessible", "remote work option",
+        "ergonomic workstation", "flexible hours",
+    ],
+    "Speech and Language Disability": ["written communication", "chat-based"],
+    "Visual Disability": ["screen reader accessible", "assistive technology", "audio support"],
+    "Intellectual Disability": ["supportive supervisor", "structured routine", "inclusive workplace"],
+    "Learning Disability": ["visual aids", "flexible pacing", "text-to-speech support"],
+    "Psychosocial Disability": ["mental wellness support", "flexible schedule", "quiet work area"],
+    "Mental Disability": ["supportive environment", "flexible work hours"],
+    "Cancer (RA 11215)": ["flexible medical leave", "remote work option", "ergonomic seating"],
+    "Rare Disease (RA 10747)": ["flexible schedule", "accessible facility"],
+}
 
-ALL_KNOWN_DISABILITIES = [
-    "Cancer (RA 11215)", "Deaf or Hard of Hearing", "Intellectual Disability",
-    "Learning Disability", "Mental Disability", "Physical Disability",
-    "Psychosocial Disability", "Rare Disease (RA 10747)",
-    "Speech and Language Disability", "Visual Disability"
-]
+MOBILITY_KEYWORDS: Dict[str, List[str]] = {
+    "Non-Ambulatory": ["wheelchair accessible", "ramp access", "elevator access", "ground floor"],
+    "Assisted": ["wheelchair accessible", "ramp access", "accessible restroom"],
+}
+
+DEVICE_KEYWORDS: Dict[str, List[str]] = {
+    "Wheelchair": ["wheelchair accessible", "ramp access", "accessible restroom", "ground floor workstation"],
+    "Hearing Aid": ["quiet office environment", "written memos"],
+    "Eyeglasses": ["standard lighting", "digital display"],
+}
 
 
 class JobRecommender:
     def __init__(self, artifacts_dir: Optional[str] = None):
-        self.vectorizer = TfidfVectorizer(
-            stop_words="english",
-            ngram_range=(1, 2),
-            token_pattern=r"(?u)\b[a-zA-Z0-9_-]+\b",
-            min_df=1
-        )
-
-    def _normalize(self, text: str) -> str:
-        if not text:
-            return ""
-        return re.sub(r"\s+", " ", str(text).lower().strip())
-
-    def _is_compatible(self, profile: Dict[str, Any], job: Dict[str, Any]) -> Tuple[bool, str]:
-        disability = profile.get("disability_type", "")
-        mobility = profile.get("mobility_status", "")
-        device = profile.get("current_assistive_device", "None")
-
-        job_text = self._normalize(
-            f"{job.get('job_title', '')} {job.get('description', '')} {job.get('required_skills', '')} {job.get('requirements', '')}"
-        )
-
-        if disability and disability not in ALL_KNOWN_DISABILITIES:
-            logger.warning(f"Unmapped disability type encountered: '{disability}'")
-
-        # 1. Mobility Status Exclusions
-        if mobility in MOBILITY_EXCLUSIONS:
-            for kw in MOBILITY_EXCLUSIONS[mobility]:
-                if kw in job_text:
-                    return False, f"Incompatible with mobility status '{mobility}' (keyword: '{kw}')"
-
-        # 2. Assistive Device Specific Exclusions
-        if device in DEVICE_EXCLUSIONS:
-            for kw in DEVICE_EXCLUSIONS[device]:
-                if kw in job_text:
-                    return False, f"Incompatible with assistive device '{device}' (keyword: '{kw}')"
-
-        # 3. Category-Specific Safety Exclusions
-        if disability in EXCLUSION_RULES:
-            relaxed_keywords = set()
-            if (disability, device) in DEVICE_RELAXATIONS:
-                relaxed_keywords = set(DEVICE_RELAXATIONS[(disability, device)])
-
-            for kw in EXCLUSION_RULES[disability]:
-                if kw in job_text and kw not in relaxed_keywords:
-                    return False, f"Incompatible with disability '{disability}' (hazard keyword: '{kw}')"
-
-        return True, "Compatible"
-
-    def _has_accommodation(self, job: Dict[str, Any]) -> bool:
-        job_text = self._normalize(f"{job.get('description', '')} {job.get('requirements', '')}")
-        return any(akw in job_text for akw in ACCOMMODATION_KEYWORDS)
+        self.loaded = True
 
     def recommend(
         self,
         profile: Dict[str, Any],
-        jobs = None,
-        top_k: int = 5
+        jobs: Optional[List[Dict[str, Any]]] = None,
+        top_k: int = 5,
+        *args,
+        **kwargs
     ) -> Dict[str, Any]:
-        if jobs is None:
+        if profile is None and "profile" in kwargs:
+            profile = kwargs["profile"]
+        if jobs is None and "jobs" in kwargs:
+            jobs = kwargs["jobs"]
+        if isinstance(jobs, int):
+            top_k = jobs
+            jobs = None
+        if jobs is None and isinstance(profile, dict):
             jobs = profile.get("available_jobs", [])
             top_k = profile.get("top_n", top_k)
+        if jobs is None:
+            jobs = []
+
         total_input = len(jobs)
-        if total_input == 0:
-            return {
-                "recommendations": [],
-                "metadata": {
-                    "total_jobs_input": 0,
-                    "after_employment_type_filter": 0,
-                    "after_secondary_type_match": 0,
-                    "after_disability_compatibility_filter": 0,
-                    "returned_count": 0
-                }
-            }
 
-        # Step 1: Multi-Attribute Safety Filtering (Layer B)
-        compatible_jobs = []
-        for job in jobs:
-            ok, reason = self._is_compatible(profile, job)
-            if ok:
-                compatible_jobs.append(job)
-            else:
-                logger.info(f"Job {job.get('id', job.get('job_post_id'))} excluded: {reason}")
+        predicted_type = profile.get("predicted_employment_type", "")
+        secondary_type = profile.get("secondary_employment_type") or ""
+        if secondary_type == predicted_type:
+            secondary_type = ""
 
-        survived_compat = len(compatible_jobs)
-        if survived_compat == 0:
+        after_type = sum(
+            1 for j in jobs
+            if j.get("employment_type") == predicted_type
+        )
+        after_secondary = sum(
+            1 for j in jobs
+            if secondary_type and j.get("employment_type") == secondary_type
+        )
+
+        filtered_jobs = self._apply_disability_compatibility(jobs, profile)
+        after_disability = len(filtered_jobs)
+
+        if not filtered_jobs:
             return {
                 "recommendations": [],
                 "metadata": {
                     "total_jobs_input": total_input,
-                    "after_employment_type_filter": 0,
-                    "after_secondary_type_match": 0,
-                    "after_disability_compatibility_filter": 0,
-                    "returned_count": 0
-                }
+                    "after_employment_type_filter": after_type,
+                    "after_secondary_type_match": after_secondary,
+                    "after_disability_compatibility_filter": after_disability,
+                    "returned_count": 0,
+                },
             }
 
-        # Step 2: TF-IDF Text Vectorization (Layer A)
-        profile_text = self._normalize(
-            f"{profile.get('skills', '')} {profile.get('educational_attainment', '')} "
-            f"{profile.get('occupation_group', '')} {profile.get('experience', '')}"
+        ranked = self._vectorize_and_rank(
+            profile, filtered_jobs, top_k, predicted_type, secondary_type
         )
 
-        job_texts = [
-            self._normalize(
-                f"{j.get('job_title', '')} {j.get('description', '')} "
-                f"{j.get('required_skills', '')} {j.get('required_education', '')}"
-            )
-            for j in compatible_jobs
-        ]
-
-        corpus = [profile_text] + job_texts
-        try:
-            tfidf_matrix = self.vectorizer.fit_transform(corpus)
-            profile_vec = tfidf_matrix[0:1]
-            job_vecs = tfidf_matrix[1:]
-            sims = cosine_similarity(profile_vec, job_vecs).flatten()
-        except Exception as e:
-            logger.error(f"TF-IDF Vectorization failed: {e}")
-            sims = np.zeros(len(compatible_jobs))
-
-        primary_type = (profile.get("predicted_employment_type") or "").strip().lower()
-        secondary_type = (profile.get("secondary_employment_type") or "").strip().lower()
-
-        primary_matches = 0
-        secondary_matches = 0
-        ranked_items = []
-
-        # Step 3: Two-Tier Soft Boost + Accommodation Boost (Layer C)
-        for i, job in enumerate(compatible_jobs):
-            base_score = float(sims[i])
-            job_emp_type = (job.get("employment_type") or "").strip().lower()
-            boost = 0.0
-            reasons = []
-
-            if primary_type and job_emp_type == primary_type:
-                boost += PRIMARY_BOOST
-                primary_matches += 1
-                reasons.append(f"matches predicted type ({profile.get('predicted_employment_type')})")
-            elif secondary_type and job_emp_type == secondary_type:
-                boost += SECONDARY_BOOST
-                secondary_matches += 1
-                reasons.append(f"matches secondary predicted type ({profile.get('secondary_employment_type')})")
-
-            if self._has_accommodation(job):
-                boost += ACCOMMODATION_BOOST
-                reasons.append("verified accessible workplace accommodation")
-
-            final_score = round(min(1.0, max(0.0, base_score + boost)), 4)
-
-            if final_score < MIN_SCORE:
-                continue
-
-            if base_score >= 0.40:
-                match_desc = "Strong text match"
-            elif base_score >= 0.15:
-                match_desc = "Moderate text match"
-            else:
-                match_desc = "Weak text match"
-
-            if reasons:
-                full_reason = f"{match_desc}; {'; '.join(reasons)}"
-            else:
-                full_reason = match_desc
-
-            job_id = job.get("id", job.get("job_post_id"))
-            ranked_items.append({
-                "job_post_id": int(job_id),
-                "similarity_score": final_score,
-                "recommendation_reason": full_reason
-            })
-
-        # Rank by final score descending
-        ranked_items.sort(key=lambda x: x["similarity_score"], reverse=True)
-        top_items = ranked_items[:top_k]
-
-        for rank, item in enumerate(top_items, start=1):
-            item["rank_position"] = rank
-
         return {
-            "recommendations": top_items,
+            "recommendations": ranked,
             "metadata": {
                 "total_jobs_input": total_input,
-                "after_employment_type_filter": primary_matches,
-                "after_secondary_type_match": secondary_matches,
-                "after_disability_compatibility_filter": survived_compat,
-                "returned_count": len(top_items)
-            }
+                "after_employment_type_filter": after_type,
+                "after_secondary_type_match": after_secondary,
+                "after_disability_compatibility_filter": after_disability,
+                "returned_count": len(ranked),
+            },
         }
+
+    def _is_education_qualified(self, applicant_edu: str, required_edu: str) -> bool:
+        if not required_edu or required_edu.strip().lower() in ["none", "any", "not required", "n/a", ""]:
+            return True
+        app_rank = EDUCATION_RANK.get(applicant_edu.strip().lower() if applicant_edu else "", 0)
+        req_rank = EDUCATION_RANK.get(required_edu.strip().lower() if required_edu else "", 0)
+        return app_rank >= req_rank
+
+    def _apply_disability_compatibility(
+        self,
+        jobs: List[Dict[str, Any]],
+        profile: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        applicant_disability = profile.get("disability_type", "")
+        mobility_status = profile.get("mobility_status", "Ambulatory") or "Ambulatory"
+        assistive_device = profile.get("current_assistive_device", "None") or "None"
+        applicant_edu = profile.get("educational_attainment", "")
+
+        compatible_jobs = []
+        for job in jobs:
+            # 1. Educational Attainment Qualification Filter
+            req_edu = job.get("required_education", "")
+            if not self._is_education_qualified(applicant_edu, req_edu):
+                continue
+
+            # 2. Explicit Job Disability Compatibility Check
+            compat_list = job.get("compatible_disabilities", []) or []
+            if compat_list:
+                if (
+                    applicant_disability
+                    and applicant_disability not in compat_list
+                    and "All Disabilities" not in compat_list
+                ):
+                    continue
+
+            # 3. Multi-Attribute Functional Exclusion Filter
+            if self._is_job_excluded(job, applicant_disability, mobility_status, assistive_device):
+                continue
+
+            compatible_jobs.append(job)
+
+        return compatible_jobs
+
+    def _is_job_excluded(
+        self,
+        job: Dict[str, Any],
+        disability_type: str,
+        mobility_status: str,
+        assistive_device: str
+    ) -> bool:
+        job_text = (
+            str(job.get("job_title", "")) + " " +
+            str(job.get("job_description", "")) + " " +
+            str(job.get("required_skills", ""))
+        ).lower()
+
+        exclusions = list(EXCLUSION_RULES.get(disability_type, []))
+        relaxations = DEVICE_RELAXATIONS.get((disability_type, assistive_device), [])
+        active_exclusions = [kw for kw in exclusions if kw not in relaxations]
+
+        active_exclusions.extend(MOBILITY_EXCLUSIONS.get(mobility_status, []))
+        active_exclusions.extend(DEVICE_EXCLUSIONS.get(assistive_device, []))
+
+        for kw in active_exclusions:
+            if re.search(r'\b' + re.escape(kw.lower()) + r'\b', job_text):
+                return True
+        return False
+
+    def _vectorize_and_rank(
+        self,
+        profile: Dict[str, Any],
+        jobs: List[Dict[str, Any]],
+        top_k: int,
+        predicted_type: str = "",
+        secondary_type: str = ""
+    ) -> List[Dict[str, Any]]:
+        applicant_doc = self._compose_applicant_document(profile)
+        job_docs = [self._compose_job_document(j) for j in jobs]
+
+        vectorizer = TfidfVectorizer(
+            lowercase=True,
+            stop_words="english",
+            ngram_range=(1, 2),
+            min_df=1,
+            max_df=0.95,
+        )
+        corpus = [applicant_doc] + job_docs
+        tfidf_matrix = vectorizer.fit_transform(corpus)
+
+        applicant_vec = tfidf_matrix[0:1]
+        job_vecs = tfidf_matrix[1:]
+        sims = cosine_similarity(applicant_vec, job_vecs).flatten()
+
+        MIN_SCORE = 0.05
+        PRIMARY_BOOST = 0.15
+        SECONDARY_BOOST = 0.07
+
+        boosted = []
+        for job, sim in zip(jobs, sims):
+            score = float(sim)
+            job_type = job.get("employment_type")
+            tier = None
+            if predicted_type and job_type == predicted_type:
+                score = min(1.0, score + PRIMARY_BOOST)
+                tier = "primary"
+            elif secondary_type and job_type == secondary_type:
+                score = min(1.0, score + SECONDARY_BOOST)
+                tier = "secondary"
+            boosted.append((job, score, tier))
+
+        boosted = [t for t in boosted if t[1] >= MIN_SCORE]
+        ranked_triples = sorted(boosted, key=lambda x: x[1], reverse=True)
+
+        return [
+            {
+                "job_post_id": int(job["id"]),
+                "similarity_score": round(float(score), 4),
+                "rank_position": i + 1,
+                "recommendation_reason": self._reason_for_score(float(score), tier),
+            }
+            for i, (job, score, tier) in enumerate(ranked_triples[:top_k])
+        ]
+
+    @staticmethod
+    def _reason_for_score(score: float, tier: Optional[str] = None) -> str:
+        if score >= 0.80:
+            base = "Very strong text match"
+        elif score >= 0.60:
+            base = "Strong text match"
+        elif score >= 0.40:
+            base = "Moderate text match"
+        else:
+            base = "Weak text match"
+
+        if tier == "secondary":
+            return f"{base}; matches second most likely employment type"
+        return base
+
+    def _compose_applicant_document(self, profile: Dict[str, Any]) -> str:
+        parts = [
+            profile.get("skills", ""),
+            profile.get("preferred_employment_type", ""),
+            profile.get("preferred_job_category", ""),
+            profile.get("educational_attainment", ""),
+            profile.get("occupation_group", ""),
+            self._derive_disability_keywords(
+                profile.get("disability_type", ""),
+                profile.get("mobility_status", "Ambulatory") or "Ambulatory",
+                profile.get("current_assistive_device", "None") or "None",
+            ),
+        ]
+        return " ".join(p for p in parts if p)
+
+    @staticmethod
+    def _compose_job_document(job: Dict[str, Any]) -> str:
+        parts = [
+            job.get("job_title", ""),
+            job.get("job_description", ""),
+            job.get("required_skills", ""),
+            job.get("employment_type", ""),
+            job.get("required_education", ""),
+            job.get("disability_friendly_notes", ""),
+        ]
+        return " ".join(p for p in parts if p)
+
+    @staticmethod
+    def _derive_disability_keywords(
+        disability_type: str,
+        mobility_status: str,
+        assistive_device: str
+    ) -> str:
+        keywords = []
+        if disability_type in DISABILITY_KEYWORDS:
+            keywords.extend(DISABILITY_KEYWORDS[disability_type])
+        if mobility_status in MOBILITY_KEYWORDS:
+            keywords.extend(MOBILITY_KEYWORDS[mobility_status])
+        if assistive_device in DEVICE_KEYWORDS:
+            keywords.extend(DEVICE_KEYWORDS[assistive_device])
+        return " ".join(keywords)
